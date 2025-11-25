@@ -53,6 +53,7 @@ namespace Domain.Geometry
 
     public class ClosedLoopSolver
     {
+        // 내부 데이터 구조
         private class DirectedEdge
         {
             public Point From { get; }
@@ -64,23 +65,109 @@ namespace Domain.Geometry
             {
                 From = from;
                 To = to;
-                // Atan2는 -PI ~ PI 반환
                 Angle = Math.Atan2(to.Y - from.Y, to.X - from.X);
             }
         }
 
-        public List<List<Point>> FindMinimalClosedLoops(IEnumerable<Segment> segments)
+        private class InternalLoop
         {
-            // 1. 버텍스 용접 (그래프 끊김 방지)
-            var weldedSegments = WeldVertices(segments);
+            public List<Segment> Segments { get; }
+            public double Area { get; }
 
-            // 2. 그래프 생성
+            public InternalLoop(List<DirectedEdge> edges)
+            {
+                Segments = edges.Select(e => new Segment(e.From, e.To)).ToList();
+                Area = CalculateSignedArea(edges.Select(e => e.From).ToList());
+            }
+
+            private double CalculateSignedArea(List<Point> polygon)
+            {
+                double area = 0;
+                for (int i = 0; i < polygon.Count; i++)
+                {
+                    var p1 = polygon[i];
+                    var p2 = polygon[(i + 1) % polygon.Count];
+                    area += (p1.X * p2.Y - p2.X * p1.Y);
+                }
+                return area * 0.5;
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // [Public API 1] 모든 루프 찾기 (기존)
+        // ------------------------------------------------------------------
+        public List<List<Segment>> FindMinimalClosedLoopsAsSegments(IEnumerable<Segment> segments)
+        {
+            // 1. 그래프 빌드
+            var graphContext = BuildGraph(segments);
+            var rawLoops = new List<InternalLoop>();
+
+            // 2. 모든 엣지 순회
+            foreach (var startEdge in graphContext.AllEdges)
+            {
+                if (startEdge.Visited) continue;
+                var loop = TraceLoop(graphContext.Graph, startEdge);
+                if (loop != null) rawLoops.Add(loop);
+            }
+
+            // 3. 외곽선 자동 필터링 후 반환
+            return FilterOuterLoops(rawLoops).Select(l => l.Segments).ToList();
+        }
+
+        // ------------------------------------------------------------------
+        // [Public API 2] 타겟 세그먼트 기준 루프 찾기 (신규 요청)
+        // ------------------------------------------------------------------
+        public List<List<Segment>> FindClosedLoopsAroundSegment(IEnumerable<Segment> allSegments, Segment target)
+        {
+            // 1. 그래프 빌드
+            var graphContext = BuildGraph(allSegments);
+            var foundLoops = new List<InternalLoop>();
+
+            // 2. 타겟 세그먼트와 일치하는 그래프상의 엣지(Edge) 찾기
+            // 타겟 세그먼트는 양방향(A->B, B->A) 두 개의 엣지에 대응될 수 있음
+            var targetEdges = FindMatchingEdges(graphContext.AllEdges, target);
+
+            foreach (var startEdge in targetEdges)
+            {
+                // 이미 방문했더라도, 타겟 기준 검색이므로 강제로 다시 추적 가능해야 함.
+                // 하지만 TraceLoop 내부에서 Visited를 체크하므로, 
+                // 특정 타겟 탐색을 위해 임시로 Visited를 초기화하거나, 
+                // 여기서는 새로 빌드된 그래프이므로 Visited가 모두 false 상태임.
+                
+                var loop = TraceLoop(graphContext.Graph, startEdge);
+                if (loop != null)
+                {
+                    foundLoops.Add(loop);
+                }
+            }
+
+            // 3. 필터링 (선택 사항)
+            // 보통 벽 하나는 [방1]과 [방2] 사이에 있거나, [방1]과 [외부] 사이에 있음.
+            // 모든 유효한 루프를 반환하되, '외부(Outer)'라고 판단되는 아주 큰 루프는 제외할 수도 있음.
+            // 여기서는 사용자가 판단할 수 있도록 유효한 기하학적 루프는 모두 반환함.
+            // 단, 노이즈(면적 0)는 TraceLoop에서 이미 제외됨.
+            
+            return foundLoops.Select(l => l.Segments).ToList();
+        }
+
+        // ------------------------------------------------------------------
+        // 내부 로직 (재사용성을 위해 분리)
+        // ------------------------------------------------------------------
+
+        private class GraphContext
+        {
+            public Dictionary<Point, List<DirectedEdge>> Graph { get; set; }
+            public List<DirectedEdge> AllEdges { get; set; }
+        }
+
+        private GraphContext BuildGraph(IEnumerable<Segment> segments)
+        {
+            var weldedSegments = WeldVertices(segments);
             var graph = new Dictionary<Point, List<DirectedEdge>>(new RobustPointComparer());
             var allEdges = new List<DirectedEdge>();
 
             foreach (var seg in weldedSegments)
             {
-                // 점(길이0) 제외
                 if (Tolerance.Equals(seg.P1.X, seg.P2.X) && Tolerance.Equals(seg.P1.Y, seg.P2.Y)) continue;
 
                 var e1 = new DirectedEdge(seg.P1, seg.P2);
@@ -92,97 +179,85 @@ namespace Domain.Geometry
                 allEdges.Add(e2);
             }
 
-            // 3. 각도 정렬
+            // 각도 정렬
             foreach (var list in graph.Values)
-            {
                 list.Sort((a, b) => a.Angle.CompareTo(b.Angle));
-            }
 
-            var rawLoops = new List<LoopResult>();
-
-            // 4. 루프 탐색 (Left-Turn Algorithm)
-            foreach (var startEdge in allEdges)
-            {
-                if (startEdge.Visited) continue;
-
-                var path = new List<DirectedEdge>();
-                var curr = startEdge;
-                bool isLoopClosed = false;
-
-                // 무한루프 방지
-                int safety = 0;
-                int maxIter = allEdges.Count * 2;
-
-                while (!curr.Visited && safety++ < maxIter)
-                {
-                    curr.Visited = true;
-                    path.Add(curr);
-
-                    var next = GetBestTurnEdge(graph, curr);
-
-                    // 끊긴 길
-                    if (next == null) break;
-
-                    // 루프 완성
-                    if (next == startEdge)
-                    {
-                        isLoopClosed = true;
-                        break;
-                    }
-
-                    // 다른 루프에 합류 (현재 루프는 무효)
-                    if (next.Visited) break;
-
-                    curr = next;
-                }
-
-                if (isLoopClosed && path.Count >= 3)
-                {
-                    var points = path.Select(e => e.From).ToList();
-                    var loopResult = new LoopResult(points);
-                    
-                    // 아주 작은 노이즈 루프(0.0001 이하)는 버림
-                    if (Math.Abs(loopResult.Area) > 0.001)
-                    {
-                        rawLoops.Add(loopResult);
-                    }
-                }
-            }
-
-            // 5. [중요] 외곽선(Outer Loop) 필터링
-            // 방(Inner Room)과 외곽선(Outer Boundary)은 면적 부호가 반대입니다.
-            // 그리고 외곽선은 모든 방의 합보다 크거나 비슷하므로 '면적이 가장 큰 것'이 외곽선일 확률이 높습니다.
-
-            if (rawLoops.Count == 0) return new List<List<Point>>();
-
-            // 부호별 그룹화 (양수 그룹 vs 음수 그룹)
-            var positiveLoops = rawLoops.Where(l => l.Area > 0).ToList();
-            var negativeLoops = rawLoops.Where(l => l.Area < 0).ToList();
-
-            // 대다수(Majority)가 속한 그룹을 '방(Room)'으로 판단
-            // (일반적인 도면은 방이 여러 개이고 외곽선은 1개임)
-            List<LoopResult> innerRooms;
-            
-            if (positiveLoops.Count > negativeLoops.Count)
-            {
-                innerRooms = positiveLoops; // 양수가 방이다
-            }
-            else if (negativeLoops.Count > positiveLoops.Count)
-            {
-                innerRooms = negativeLoops; // 음수가 방이다
-            }
-            else
-            {
-                // 개수가 같다면(방1개 vs 외곽선1개), 절대 면적이 작은 것이 방이다.
-                var maxPos = positiveLoops.Any() ? positiveLoops.Max(l => Math.Abs(l.Area)) : 0;
-                var maxNeg = negativeLoops.Any() ? negativeLoops.Max(l => Math.Abs(l.Area)) : 0;
-                innerRooms = maxPos < maxNeg ? positiveLoops : negativeLoops;
-            }
-
-            // 최종 결과: 방의 좌표 리스트만 반환
-            return innerRooms.Select(l => l.Vertices).ToList();
+            return new GraphContext { Graph = graph, AllEdges = allEdges };
         }
 
+        private InternalLoop TraceLoop(Dictionary<Point, List<DirectedEdge>> graph, DirectedEdge startEdge)
+        {
+            var path = new List<DirectedEdge>();
+            var curr = startEdge;
+            bool isClosed = false;
+            int safety = 0;
+            int maxIter = 5000; // 충분히 큰 수
+
+            while (!curr.Visited && safety++ < maxIter)
+            {
+                curr.Visited = true;
+                path.Add(curr);
+
+                var next = GetBestTurnEdge(graph, curr);
+                if (next == null) break;
+
+                if (next == startEdge)
+                {
+                    isClosed = true;
+                    break;
+                }
+                
+                // 주의: 타겟 검색 시에는 다른 경로로 합류해도 루프로 인정하지 않음 (단순화)
+                if (next.Visited) break; 
+                curr = next;
+            }
+
+            if (isClosed && path.Count >= 3)
+            {
+                var loop = new InternalLoop(path);
+                if (Math.Abs(loop.Area) > 0.001) return loop;
+            }
+            return null;
+        }
+
+        private List<DirectedEdge> FindMatchingEdges(List<DirectedEdge> allEdges, Segment target)
+        {
+            var matches = new List<DirectedEdge>();
+            var comparer = new RobustPointComparer();
+
+            // Welding으로 인해 좌표값이 미세하게 다를 수 있으므로 RobustComparer 사용
+            // Target의 P1->P2 방향과 P2->P1 방향 모두 찾음
+            foreach (var edge in allEdges)
+            {
+                bool matchForward = comparer.Equals(edge.From, target.P1) && comparer.Equals(edge.To, target.P2);
+                bool matchBackward = comparer.Equals(edge.From, target.P2) && comparer.Equals(edge.To, target.P1);
+
+                if (matchForward || matchBackward)
+                {
+                    matches.Add(edge);
+                }
+            }
+            return matches;
+        }
+
+        private List<InternalLoop> FilterOuterLoops(List<InternalLoop> rawLoops)
+        {
+            if (rawLoops.Count == 0) return rawLoops;
+
+            var positive = rawLoops.Where(l => l.Area > 0).ToList();
+            var negative = rawLoops.Where(l => l.Area < 0).ToList();
+
+            // 다수결 원칙으로 방(Room) 그룹 판별
+            if (positive.Count > negative.Count) return positive;
+            if (negative.Count > positive.Count) return negative;
+
+            double maxPos = positive.Any() ? positive.Max(l => Math.Abs(l.Area)) : 0;
+            double maxNeg = negative.Any() ? negative.Max(l => Math.Abs(l.Area)) : 0;
+            return maxPos < maxNeg ? positive : negative;
+        }
+
+        // --- Helpers ---
         private void AddToGraph(Dictionary<Point, List<DirectedEdge>> graph, DirectedEdge edge)
         {
             if (!graph.TryGetValue(edge.From, out var list))
@@ -193,7 +268,21 @@ namespace Domain.Geometry
             list.Add(edge);
         }
 
-        private List<Segment> WeldVertices(IEnumerable<Segment> originalSegments)
+        private DirectedEdge GetBestTurnEdge(Dictionary<Point, List<DirectedEdge>> graph, DirectedEdge incoming)
+        {
+            if (!graph.TryGetValue(incoming.To, out var candidates) || candidates.Count == 0) return null;
+            
+            double backAngle = incoming.Angle + Math.PI;
+            if (backAngle > Math.PI) backAngle -= 2 * Math.PI;
+
+            foreach (var edge in candidates)
+            {
+                if (edge.Angle > backAngle + Tolerance.Epsilon) return edge;
+            }
+            return candidates[0];
+        }
+
+        private List<Segment> WeldVertices(IEnumerable<Segment> segments)
         {
             var uniquePoints = new Dictionary<Point, Point>(new RobustPointComparer());
             var result = new List<Segment>();
@@ -205,30 +294,12 @@ namespace Domain.Geometry
                 return p;
             }
 
-            foreach (var seg in originalSegments)
+            foreach (var seg in segments)
             {
+                // ID 복사 등이 필요하면 여기서 처리
                 result.Add(new Segment(GetOrAdd(seg.P1), GetOrAdd(seg.P2)));
             }
             return result;
-        }
-
-        private DirectedEdge GetBestTurnEdge(Dictionary<Point, List<DirectedEdge>> graph, DirectedEdge incoming)
-        {
-            if (!graph.TryGetValue(incoming.To, out var candidates) || candidates.Count == 0) return null;
-
-            // 현재 엣지의 역방향 각도
-            double backAngle = incoming.Angle + Math.PI;
-            if (backAngle > Math.PI) backAngle -= 2 * Math.PI;
-
-            // backAngle보다 크면서 가장 가까운 각도를 찾음 (Left-Most)
-            // 리스트는 이미 정렬되어 있음
-            foreach (var edge in candidates)
-            {
-                if (edge.Angle > backAngle + Tolerance.Epsilon) return edge;
-            }
-
-            // 한 바퀴 돌아서 제일 작은 각도 선택
-            return candidates[0];
         }
     }
 }

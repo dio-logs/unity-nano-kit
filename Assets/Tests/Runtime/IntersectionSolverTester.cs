@@ -188,10 +188,10 @@ namespace Tests.Runtime
             var segments = SegmentSplitter.SplitSegmentsAtIntersections(solverSegments);
             DrawSplitSegments(segments);
             var loopSolver = new ClosedLoopSolver();
-            var loops = loopSolver.FindMinimalClosedLoops(segments);
-
+            // var loops = loopSolver.FindMinimalClosedLoops(segments);
+            var loops = loopSolver.FindMinimalClosedLoopsAsSegments(segments);
             Debug.Log("total loop : " + loops.Count);
-            loops.ForEach(loop => loop.ForEach(p => Debug.Log(p.ToUnityVector2())));
+            loops.ForEach(loop => Debug.Log(loop.Count));
 
 
         }
